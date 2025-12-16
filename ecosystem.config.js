@@ -1,24 +1,40 @@
 module.exports = {
-  apps: [{
-    name: 'bullmq-demo',
-    script: './dist/index.js',
-    instances: 1,
-    exec_mode: 'fork',
-    watch: false,
-    env: {
-      NODE_ENV: 'production',
-      PORT: 3000
+  apps: [
+    // API Server - handles HTTP requests and adds jobs to queues
+    {
+      name: "bullmq-server",
+      script: "./dist/server.js",
+      instances: 1,
+      exec_mode: "fork",
+      watch: false,
+      env: {
+        NODE_ENV: "production",
+        PORT: 3000,
+      },
+      error_file: "./logs/server-error.log",
+      out_file: "./logs/server-out.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss Z",
+      merge_logs: true,
+      autorestart: true,
+      max_memory_restart: "500M",
     },
-    env_development: {
-      NODE_ENV: 'development',
-      PORT: 3000
+    // Workers - process jobs from queues
+    {
+      name: "bullmq-workers",
+      script: "./dist/workers.js",
+      instances: 2, // Run 2 worker instances for better throughput
+      exec_mode: "cluster", // Use cluster mode for multiple instances
+      watch: false,
+      env: {
+        NODE_ENV: "production",
+      },
+      error_file: "./logs/workers-error.log",
+      out_file: "./logs/workers-out.log",
+      log_date_format: "YYYY-MM-DD HH:mm:ss Z",
+      merge_logs: true,
+      autorestart: true,
+      max_memory_restart: "800M",
+      restart_delay: 4000,
     },
-    error_file: './logs/pm2-error.log',
-    out_file: './logs/pm2-out.log',
-    log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
-    merge_logs: true,
-    autorestart: true,
-    max_memory_restart: '500M',
-    restart_delay: 4000
-  }]
+  ],
 };

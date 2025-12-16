@@ -1,0 +1,235 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  GCP_PROJECT_ID: pelagic-gist-459620-q8
+  GCP_PROJECT_NAME: cverai
+  IMAGE_NAME: express-app
+  GCP_REGION: us-central1
+  COMPUTE_ZONE: us-central1-a
+  INSTANCE_NAME: express-app-instance
+
+jobs:
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        if: success()
+        with:
+          files: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: |
+          gcloud auth configure-docker gcr.io
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg GIT_COMMIT=${{ github.sha }} \
+            --build-arg VERSION=${{ github.ref_name }} \
+            -t gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Push Docker image to GCR
+        run: |
+          docker push gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  deploy:
+    name: Deploy to GCP Compute Engine
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Check if instance exists
+        id: check-instance
+        run: |
+          if gcloud compute instances describe ${{ env.INSTANCE_NAME }} \
+            --zone=${{ env.COMPUTE_ZONE }} \
+            --project=${{ env.GCP_PROJECT_ID }} 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Compute Engine instance
+        if: steps.check-instance.outputs.exists == 'false'
+        run: |
+          gcloud compute instances create-with-container ${{ env.INSTANCE_NAME }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --zone=${{ env.COMPUTE_ZONE }} \
+            --machine-type=e2-small \
+            --network-interface=network-tier=PREMIUM,subnet=default \
+            --maintenance-policy=MIGRATE \
+            --provisioning-model=STANDARD \
+            --scopes=https://www.googleapis.com/auth/cloud-platform \
+            --tags=http-server,https-server \
+            --container-image=gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --container-restart-policy=always \
+            --container-env=NODE_ENV=production,PORT=8080,APP_VERSION=${{ github.sha }} \
+            --labels=app=express,environment=production,managed-by=github-actions
+
+      - name: Update container on existing instance
+        if: steps.check-instance.outputs.exists == 'true'
+        run: |
+          gcloud compute instances update-container ${{ env.INSTANCE_NAME }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --zone=${{ env.COMPUTE_ZONE }} \
+            --container-image=gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --container-env=NODE_ENV=production,PORT=8080,APP_VERSION=${{ github.sha }}
+
+      - name: Configure firewall rules
+        run: |
+          if ! gcloud compute firewall-rules describe allow-http-8080 --project=${{ env.GCP_PROJECT_ID }} 2>/dev/null; then
+            gcloud compute firewall-rules create allow-http-8080 \
+              --project=${{ env.GCP_PROJECT_ID }} \
+              --direction=INGRESS \
+              --priority=1000 \
+              --network=default \
+              --action=ALLOW \
+              --rules=tcp:8080 \
+              --source-ranges=0.0.0.0/0 \
+              --target-tags=http-server
+          fi
+
+      - name: Wait for instance to be ready
+        run: |
+          echo "Waiting for instance to be ready..."
+          sleep 30
+
+      - name: Get instance external IP
+        id: get-ip
+        run: |
+          EXTERNAL_IP=$(gcloud compute instances describe ${{ env.INSTANCE_NAME }} \
+            --zone=${{ env.COMPUTE_ZONE }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+          echo "ip=$EXTERNAL_IP" >> $GITHUB_OUTPUT
+          echo "External IP: $EXTERNAL_IP"
+
+      - name: Health check
+        run: |
+          MAX_ATTEMPTS=30
+          ATTEMPT=1
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Health check attempt $ATTEMPT of $MAX_ATTEMPTS"
+            
+            if curl -f -s http://${{ steps.get-ip.outputs.ip }}:8080/health/live > /dev/null; then
+              echo "✅ Application is healthy!"
+              curl -s http://${{ steps.get-ip.outputs.ip }}:8080/health | jq .
+              exit 0
+            fi
+            
+            echo "Application not ready yet, waiting..."
+            sleep 10
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+          exit 1
+
+      - name: Deployment summary
+        run: |
+          echo "🚀 Deployment Summary"
+          echo "===================="
+          echo "Project: ${{ env.GCP_PROJECT_NAME }}"
+          echo "Instance: ${{ env.INSTANCE_NAME }}"
+          echo "Zone: ${{ env.COMPUTE_ZONE }}"
+          echo "Image: gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "External IP: ${{ steps.get-ip.outputs.ip }}"
+          echo "Application URL: http://${{ steps.get-ip.outputs.ip }}:8080"
+          echo "Health Check: http://${{ steps.get-ip.outputs.ip }}:8080/health"
